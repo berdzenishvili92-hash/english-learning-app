@@ -4,18 +4,14 @@ import anthropic
 import base64
 import json
 import re
-import os
 import hashlib
 import datetime
+import requests
 
 # ══════════════════════════════════════════════
-#  CONFIGURATION
+#  CONFIGURATION  (გასაღებები st.secrets-შია)
 # ══════════════════════════════════════════════
-ANTHROPIC_API_KEY = "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"
 MODEL = "claude-sonnet-4-6"
-
-# ბაზის ფაილი — ამ ფაილის გადაწერა = სრული სარეზერვო ასლი
-DATA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "english_learning_data.json")
 
 # ══════════════════════════════════════════════
 #  PAGE CONFIG
@@ -189,35 +185,57 @@ hr { border-color: rgba(255,255,255,0.08) !important; }
 """, unsafe_allow_html=True)
 
 # ══════════════════════════════════════════════
-#  DATABASE (JSON ფაილი)
+#  DATABASE (Supabase)
 # ══════════════════════════════════════════════
 def _hash_pw(pw: str) -> str:
     return hashlib.sha256(pw.encode("utf-8")).hexdigest()
 
-def _load_db() -> dict:
-    if not os.path.exists(DATA_FILE):
-        return {"version": 1, "users": {}}
-    try:
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {"version": 1, "users": {}}
+def _sb_headers() -> dict:
+    key = st.secrets["SUPABASE_KEY"]
+    return {
+        "apikey": key,
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+        "Prefer": "return=representation",
+    }
 
-def _write_db(db: dict):
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(db, f, ensure_ascii=False, indent=2)
+def _sb_url(table: str) -> str:
+    return f"{st.secrets['SUPABASE_URL']}/rest/v1/{table}"
+
+def _get_user(username: str) -> dict | None:
+    r = requests.get(
+        _sb_url("users"),
+        headers=_sb_headers(),
+        params={"username": f"eq.{username}", "select": "*"},
+    )
+    data = r.json()
+    return data[0] if isinstance(data, list) and data else None
+
+def _username_exists(username: str) -> bool:
+    r = requests.get(
+        _sb_url("users"),
+        headers=_sb_headers(),
+        params={"username": f"eq.{username}", "select": "id"},
+    )
+    data = r.json()
+    return isinstance(data, list) and len(data) > 0
 
 def save_user_data():
-    """მიმდინარე მომხმარებლის მონაცემები ფაილში შეინახოს."""
     if not st.session_state.get("logged_in"):
         return
-    db = _load_db()
-    uname = st.session_state.current_user
-    if uname in db["users"]:
-        db["users"][uname]["dictionary"]  = st.session_state.dictionary
-        db["users"][uname]["known_words"] = st.session_state.known_words
-        db["users"][uname]["review_list"] = st.session_state.review_list
-        _write_db(db)
+    try:
+        requests.patch(
+            _sb_url("users"),
+            headers=_sb_headers(),
+            params={"username": f"eq.{st.session_state.current_user}"},
+            json={
+                "dictionary":  st.session_state.dictionary,
+                "known_words": st.session_state.known_words,
+                "review_list": st.session_state.review_list,
+            },
+        )
+    except Exception:
+        pass
 
 # ══════════════════════════════════════════════
 #  SESSION STATE
@@ -245,7 +263,7 @@ _init()
 # ══════════════════════════════════════════════
 @st.cache_resource
 def get_client() -> anthropic.Anthropic:
-    return anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    return anthropic.Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
 
 # ══════════════════════════════════════════════
 #  LOGIN / REGISTER PAGE
@@ -269,8 +287,7 @@ def page_auth():
             if not uname or not passw:
                 st.error("შეავსე ყველა ველი")
             else:
-                db = _load_db()
-                user = db["users"].get(uname.strip().lower())
+                user = _get_user(uname.strip().lower())
                 if not user:
                     st.error("❌ მომხმარებელი ვერ მოიძებნა")
                 elif user["password_hash"] != _hash_pw(passw):
@@ -279,9 +296,9 @@ def page_auth():
                     st.session_state.logged_in    = True
                     st.session_state.current_user = uname.strip().lower()
                     st.session_state.display_name = user["display_name"]
-                    st.session_state.dictionary   = user.get("dictionary", [])
-                    st.session_state.known_words  = user.get("known_words", [])
-                    st.session_state.review_list  = user.get("review_list", [])
+                    st.session_state.dictionary   = user.get("dictionary") or []
+                    st.session_state.known_words  = user.get("known_words") or []
+                    st.session_state.review_list  = user.get("review_list") or []
                     st.session_state.chat_history = []
                     st.rerun()
         st.markdown('</div>', unsafe_allow_html=True)
@@ -303,42 +320,36 @@ def page_auth():
             elif not re.match(r'^[a-z0-9_]+$', uname_r.lower()):
                 st.error("❌ Username-ში მხოლოდ ლათინური ასოები, ციფრები და _ ")
             else:
-                db = _load_db()
-                if uname_r.lower() in db["users"]:
+                if _username_exists(uname_r.lower()):
                     st.error("❌ ეს username უკვე გამოყენებულია")
                 else:
-                    db["users"][uname_r.lower()] = {
-                        "password_hash": _hash_pw(pw1),
-                        "display_name":  disp,
-                        "created_at":    str(datetime.date.today()),
-                        "dictionary":    [],
-                        "known_words":   [],
-                        "review_list":   [],
-                    }
-                    _write_db(db)
-                    st.success("✅ რეგისტრაცია წარმატებულია! გადადი 'შესვლა' tab-ზე.")
+                    try:
+                        r = requests.post(
+                            _sb_url("users"),
+                            headers=_sb_headers(),
+                            json={
+                                "username":      uname_r.lower(),
+                                "password_hash": _hash_pw(pw1),
+                                "display_name":  disp,
+                                "created_at":    str(datetime.date.today()),
+                                "dictionary":    [],
+                                "known_words":   [],
+                                "review_list":   [],
+                            },
+                        )
+                        if r.status_code in (200, 201):
+                            st.success("✅ რეგისტრაცია წარმატებულია! გადადი 'შესვლა' tab-ზე.")
+                        else:
+                            st.error(f"❌ შეცდომა: {r.text}")
+                    except Exception as e:
+                        st.error(f"❌ შეცდომა: {e}")
         st.markdown('</div>', unsafe_allow_html=True)
 
     # ── ბაზის აღდგენა ──
     with tab_restore:
         st.markdown('<div class="auth-card">', unsafe_allow_html=True)
-        st.markdown("**სარეზერვო ფაილიდან აღდგენა:**")
-        st.caption("ატვირთე შენახული `english_learning_data.json` ფაილი")
-        backup = st.file_uploader("ფაილის ატვირთვა", type=["json"], key="restore_file")
-        if backup:
-            try:
-                data = json.loads(backup.read().decode("utf-8"))
-                if "users" not in data:
-                    st.error("❌ ეს სწორი სარეზერვო ფაილი არ არის")
-                else:
-                    users = list(data["users"].keys())
-                    st.success(f"✅ ფაილში ნაპოვნია {len(users)} მომხმარებელი: {', '.join(users)}")
-                    if st.button("🔄 ბაზის აღდგენა", type="primary", use_container_width=True, key="do_restore"):
-                        _write_db(data)
-                        st.success("✅ ბაზა წარმატებით აღდგა! ახლა შეგიძლია შეხვიდე.")
-                        st.rerun()
-            except Exception as e:
-                st.error(f"❌ ფაილის წაკითხვის შეცდომა: {e}")
+        st.info("მონაცემები Supabase-ში ინახება — ავტომატურად უსაფრთხოა.\n\n"
+                "პაროლის დავიწყების შემთხვევაში დაუკავშირდი ადმინს.")
         st.markdown('</div>', unsafe_allow_html=True)
 
 
@@ -737,10 +748,7 @@ with st.sidebar:
     st.metric("გასამეორებელი", len(st.session_state.review_list))
     st.divider()
 
-    st.caption("💾 სარეზერვო ფაილი:")
-    st.markdown(f'<div class="backup-box">{DATA_FILE}</div>', unsafe_allow_html=True)
-    st.caption("ამ ფაილის გადაწერა = სრული სარეზერვო ასლი")
-
+    st.caption("☁️ მონაცემები Supabase-ში ინახება")
     if st.button("💾 ხელით შენახვა", use_container_width=True):
         save_user_data()
         st.success("შენახულია!")
